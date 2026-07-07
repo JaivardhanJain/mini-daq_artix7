@@ -1,0 +1,25 @@
+# Mini-DAQ FFT test vectors  (N=16, Q1.15)
+
+[dc]
+# input samples as signed Q1.15 integers:
+in:  16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384 16384
+# expected output magnitudes (float reference):
+mag: 8.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000
+
+[sine_bin3]
+# input samples as signed Q1.15 integers:
+in:  0 15137 11585 -6270 -16384 -6270 11585 15137 0 -15137 -11585 6270 16384 6270 -11585 -15137
+# expected output magnitudes (float reference):
+mag: 0.0000 0.0000 0.0000 4.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 4.0000 0.0000 0.0000
+
+[two_tone_3_5]
+# input samples as signed Q1.15 integers:
+in:  0 15137 0 -6270 0 -6270 0 15137 0 -15137 0 6270 0 6270 0 -15137
+# expected output magnitudes (float reference):
+mag: 0.0000 0.0000 0.0000 2.0000 0.0000 2.0000 0.0000 0.0000 0.0000 0.0000 0.0000 2.0000 0.0000 2.0000 0.0000 0.0000
+
+[impulse]
+# input samples as signed Q1.15 integers:
+in:  29491 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+# expected output magnitudes (float reference):
+mag: 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000 0.9000

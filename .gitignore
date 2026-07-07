@@ -1,0 +1,59 @@
+# ============================================================
+# Mini-DAQ .gitignore  —  Vivado / Vitis / Python
+# ============================================================
+
+# ---- Vivado / Vitis build output (large, regenerable) ----
+*.jou
+*.log
+*.str
+*.pb
+*.wdb
+*.wcfg
+*.rpt
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+*.srcs/**/ipshared/
+*.hbs
+*.zip
+*.bit
+*.bin
+*.mmi
+*.ltx
+
+# Vitis / SDK workspace artifacts
+.metadata/
+*.sdk/
+Debug/
+Release/
+_ide/
+.cproject
+.project
+.sdkproject
+
+# ---- ModelSim / simulation output ----
+work/
+transcript
+vsim.wlf
+*.vcd
+modelsim.ini
+*.mti
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ---- OS / editor cruft ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~
+.vscode/
