@@ -112,4 +112,4 @@ deriving the twiddle position and indices from one counter, with
 - cosim to confirm RTL matches C.
 - Later: per-stage bit-growth types (vs uniform Q5.15), scale N to 64-256.
 
-_Generated during Phase 1 HLS bring-up (Day 2)._
+_Generated during Phase 1 HLS bring-up (Day 7 — 2026-07-14; design decisions were Day 2, 2026-07-07)._
