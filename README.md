@@ -37,9 +37,9 @@ Goal: understand the HLS FFT flow — not writing the kernel yet.
 - [x] Golden model (direct DFT, radix-2, Q1.15 fixed-point) — verified vs NumPy
 - [x] Test vectors exported
 - [x] Project docs (design notes, board XADC pin map, project plan)
-- [~] Learning HLS (pp4fpgas intro done; FFT chapter in progress)
-- [ ] HLS FFT: C kernel + AXI-Stream + csim vs golden vectors
-- [ ] HLS FFT: csynth + cosim
+- [x] Learning HLS (pp4fpgas intro + FFT chapter: pragmas, bit-reversal, task pipelining)
+- [~] HLS FFT: C++ kernel (dataflow, Q5.15, twiddle ROM) + csim vs golden vectors (4/4 pass); AXI-Stream still to add
+- [~] HLS FFT: csynth done (Q5.15: 12 DSP, 152 MHz, fits XC7A35T — see docs/hls_synthesis_results.md); cosim + tripcount/loop-flatten pending
 - [ ] End-to-end demo: XADC -> HLS FFT -> UART -> Python
 - [ ] Phase 2: switch mode-select + SPI-flash boot
 - [ ] Hand-RTL FFT (butterfly -> full FFT -> ModelSim) + RTL-vs-HLS comparison
