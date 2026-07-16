@@ -49,6 +49,18 @@ Went past the "just learn it" goal and shipped a working, optimized HLS FFT.
 - Remaining HLS polish: `ap_ctrl_chain` (frame overlap), AXI-Stream interfaces,
   cosim.
 
+## Day 8 plan — finish the HLS track
+Goal: validate, re-interface for streaming, and package the FFT as an IP.
+- Hour 1: **cosim** — run the C testbench against the generated RTL (xsim);
+  confirm RTL == C and get measured latency.
+- Hour 2: **AXI-Stream (part 1)** — swap the `ap_memory` array ports for
+  `hls::stream` + `axis` (TVALID/TREADY/TLAST); update the testbench; csim.
+- Hour 3: **AXI-Stream (part 2)** — csynth + cosim the streaming version;
+  confirm TDATA/TVALID/TREADY/TLAST ports and that it still fits.
+- Hour 4: **block protocol + export** — set `ap_ctrl_chain`/`ap_ctrl_none` for
+  continuous frames (clears the Day-7 overlap warning), then `export_design`
+  to package the Vivado IP for the SoC block design.
+
 ## Status
 - [x] Golden model (direct DFT, radix-2, Q1.15 fixed-point) — verified vs NumPy
 - [x] Test vectors exported

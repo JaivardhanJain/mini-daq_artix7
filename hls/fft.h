@@ -2,6 +2,8 @@
 #define FFT_H
 
 #include "ap_fixed.h"
+#include "hls_stream.h"      /* must precede '#define SIZE' below --        */
+#include "ap_axi_sdata.h"    /* these headers use template<size_t SIZE>.   */
 
 /* ------------------------------------------------------------------
  * Mini-DAQ FFT configuration  (Phase 1: N = 16)
@@ -21,6 +23,18 @@
  */
 typedef ap_fixed<20,5> DTYPE;
 
+/* --- AXI4-Stream interface (Day 8) ---------------------------------
+ * One complex Q5.15 sample per beat, packed into a 40-bit TDATA:
+ *   data[19:0]  = real (Q5.15 raw bits)
+ *   data[39:20] = imag (Q5.15 raw bits)
+ * TLAST marks the 16th sample of each frame.
+ * (hls_stream.h / ap_axi_sdata.h are included at the top of this file,
+ *  above '#define SIZE' -- they contain template<size_t SIZE>, which the
+ *  SIZE macro would otherwise corrupt.) */
+typedef ap_axiu<40, 0, 0, 0> axis_t;   /* 40-bit payload + TLAST/TKEEP/TSTRB */
+
+void fft_axis(hls::stream<axis_t> &in, hls::stream<axis_t> &out);
+void fft_dataflow(DTYPE X_R[SIZE], DTYPE X_I[SIZE], DTYPE OUT_R[SIZE], DTYPE OUT_I[SIZE]);
 void fft(DTYPE X_R[SIZE], DTYPE X_I[SIZE]);
 void bit_reverse(DTYPE X_R[SIZE], DTYPE X_I[SIZE]);
 unsigned int reverse_bits(unsigned int input);

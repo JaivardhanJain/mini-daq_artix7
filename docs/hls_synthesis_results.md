@@ -98,6 +98,22 @@ deriving the twiddle position and indices from one counter, with
 
 ---
 
+## 5.c  Cosim — RTL matches C (Day 8, Hour 1)
+
+Ran `cosim_design`: HLS generated the Verilog RTL, then ran it in the xsim
+simulator driven by the *same* `fft_tb` C testbench (C-check before sim, RTL
+sim, C-check after).
+
+**Result: `C/RTL co-simulation finished: PASS`** — 4/4 vectors, both the pre-
+and post-simulation C checks. So the generated hardware behaves identically to
+the C.
+
+It also **confirmed the performance estimates with a real simulation**: RTL
+transactions completed 190 ns apart = **19 cycles interval** (matches the
+csynth estimate exactly), first result at ~76 cycles ≈ the 74-cycle latency
+estimate. The dataflow deadlock detector ran clean (no stalls). So the 74/19
+numbers are now measured, not just estimated.
+
 ## Notes
 - `fft_stage_one` uses **0 DSPs** (twiddle W^0 = 1 -> pure add/sub); stages 2-4
   use 4 DSPs each = 12 total.

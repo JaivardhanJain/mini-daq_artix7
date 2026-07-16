@@ -182,6 +182,22 @@ them (the same TRIPCOUNT situation the pp4fpgas text describes).
 **Analysis:** false alarms — `i_lower = i + numBF` is always < 16; csim passing
 confirms no real overflow. Can be silenced later with an `assert` on the index.
 
+### 3.12 `SIZE` macro collides with `hls_stream.h` template (Day 8)
+**Symptom:** csim of the AXI-Stream version failed to compile:
+`error: expected '>' before numeric constant` pointing at `#define SIZE 16`,
+expanded inside `hls_stream_thread_unsafe.h`'s `template<size_t SIZE>`.
+**Cause:** `fft.h` did `#define SIZE 16` and then `#include "hls_stream.h"`
+*after* it. The preprocessor textually replaced the header's `SIZE` template
+parameter with `16`, producing `template<size_t 16>` -- nonsense. `SIZE` is too
+generic a macro name.
+**Fix (done):** moved `#include "hls_stream.h"` and `#include "ap_axi_sdata.h"`
+to the top of `fft.h`, *above* `#define SIZE`, so the headers are parsed while
+`SIZE` is still an ordinary identifier. Streaming logic was unaffected.
+**Cleaner long-term fix (deferred):** rename the macro `SIZE` -> `FFT_SIZE`
+everywhere to avoid the collision entirely.
+**Lesson:** include third-party/library headers before defining short, common
+macro names; or namespace your macros (`FFT_SIZE`).
+
 ---
 
 ## 4. Verification methodology (how correctness was ensured)
@@ -256,11 +272,22 @@ latency that was `?` before.
 
 ---
 
+## 5.c  Cosim — RTL verification (Day 8, Hour 1)
+
+Ran `cosim_design`: the generated Verilog RTL was simulated in xsim, driven by
+the same self-checking C testbench. **Result: `C/RTL co-simulation PASS`** (4/4
+vectors, pre- and post-sim C checks). This is the step that proves HLS built
+what the C meant — csim only ran the C on the CPU; cosim ran the actual
+hardware. It also confirmed the estimates with a real sim: measured interval
+= **19 cycles** (transactions 190 ns apart) and latency ~76 ≈ the 74 estimate,
+deadlock detector clean. So 74/19 are now measured, not estimated.
+
 ## 6. Known remaining work (honest status)
 
-- `ap_ctrl_chain` for frame-to-frame overlap (streaming throughput).
-- AXI-Stream interfaces to integrate with XADC -> FFT -> MicroBlaze.
-- cosim (RTL/C co-simulation) to confirm the generated RTL matches the C.
+- **AXI-Stream interfaces** (Day 8, Hours 2-3, in progress) to integrate with
+  XADC -> FFT -> MicroBlaze.
+- `ap_ctrl_chain` / `ap_ctrl_none` for frame-to-frame overlap (Day 8, Hour 4).
+- `export_design` to package the Vivado IP (Day 8, Hour 4).
 - Later: per-stage bit-growth types (vs the single uniform Q5.15), scale N to 64-256.
 
 ---
@@ -286,5 +313,123 @@ latency that was `?` before.
   with gcc/ap_fixed pre-checks before each Vitis run.
 - **"What would you do next / what's not done?"** See section 6 — I can name the
   exact remaining directives and integration steps and what each buys.
+
+---
+
+## 8. AXI-Stream interface — design decisions (Day 8, Hours 2-3)
+
+The FFT was re-interfaced from memory-mapped array ports (`ap_memory`) to
+AXI4-Stream so it can drop into the streaming DAQ pipeline (XADC -> FFT ->
+MicroBlaze/DMA). Key decisions and why:
+
+- **AXI4-Stream, not AXI4-Lite or full AXI4 memory-mapped.** The FFT datapath
+  is a *stream*: samples are consumed in order, one after another, with no
+  addressing. AXI4-Stream matches that exactly and sustains 1 beat/cycle with
+  back-pressure — ideal for a continuous XADC feed.
+  *Why not AXI4-Lite:* it is a single-word, register-oriented, memory-mapped
+  interface meant for **control/status** (start/done/config), not bulk data — far
+  too slow and semantically wrong for the sample stream.
+  *Why not full AXI4-MM:* addressed bursts + IDs are machinery the FFT never
+  needs (no random access to its input), so it would be pure overhead.
+  *Ecosystem:* Xilinx DMA (MM2S/S2MM), AXIS FIFOs, and DSP IP all speak
+  AXI-Stream, so this is the canonical `XADC -> FFT -> DMA -> MicroBlaze` flow.
+  *Not either/or:* the final design will likely pair **AXI4-Stream for the data
+  plane** with a small **AXI4-Lite control plane** (start/stop, Phase-4
+  mode-select, status). Full AXI4-MM would only apply if the FFT had to master
+  DRAM directly for large buffered transforms — not the case for N=16.
+
+- **Wrap, don't rewrite.** Added a thin top wrapper `fft_axis` that does only
+  stream I/O and calls the *unchanged, verified* `fft_dataflow` core.
+  *Why:* the FFT math was already csim/cosim-verified; re-interfacing should not
+  risk it. `fft_axis` = the loading dock; `fft_dataflow` = the assembly line.
+
+- **40-bit TDATA = one complex Q5.15 sample per beat** (`data[19:0]`=real,
+  `data[39:20]`=imag).
+  *Why 40:* a Q5.15 value is 20 bits; a complex number is two of them = 40, the
+  tightest fit. It is also byte-aligned (40 = 5 bytes), which AXI-Stream wants
+  (TKEEP/TSTRB are 1 bit/byte). *Alternatives:* 32 bits is too small to hold two
+  20-bit values; 64 bits works but wastes 24 idle bits/beat. 40 is the minimal
+  clean width.
+
+- **One sample per beat / 16 beats per frame, TLAST on the 16th.**
+  *Why:* keeps "1 sample = 1 beat" so framing is simple; TLAST delimits each
+  16-point spectrum for a downstream DMA/consumer. Splitting real/imag across
+  beats would double the beat count and complicate framing.
+
+- **`keep = strb = -1` (all ones).**
+  *Why:* asserts "all 5 bytes are valid data." `-1` in an unsigned N-bit field
+  is all 1s (two's-complement), a width-agnostic way to say "all bytes present."
+  Leaving them unset could let a downstream block / the AXIS protocol checker
+  treat bytes as null.
+
+- **No TUSER/TID/TDEST (`ap_axiu<40,0,0,0>`).**
+  *Why:* the link is point-to-point (one source -> one sink), so there is no
+  routing to do. TDEST/TID only matter behind an AXI-Stream switch that fans a
+  stream out to multiple destinations; we have none, so those wires would be dead.
+
+- **Uniform `axis_t` on both input and output** even though the input imag is
+  always 0 (real XADC samples).
+  *Why:* one shared 40-bit type keeps the code simple; it costs only ~20 idle
+  input wires. A separate 20-bit input stream could reclaim them later (e.g. to
+  match a DMA data width) — deferred as a minor optimization.
+
+- **`#pragma HLS INTERFACE axis` on the top-level stream ports.**
+  *Why:* it makes each top-level `hls::stream` a standard AXI4-Stream port
+  (TDATA/TVALID/TREADY/TLAST...) that snaps into Xilinx AXIS IP. Without it a
+  top-level stream is a generic `ap_fifo` port; an *internal* stream (function to
+  function) is just an on-chip FIFO.
+
+- **Deferred:** block-level control (`ap_ctrl_chain`/`ap_ctrl_none`) for
+  frame-to-frame overlap is left to Hour 4 — Hours 2-3 only prove the streaming
+  interface is functionally correct.
+
+## 9. FAQ — AXI-Stream & verification concepts
+
+**Q: csim vs cosim?** csim compiles the C/C++ with gcc and runs it on the CPU —
+it tests the *algorithm* (fast). cosim runs the HLS-*generated RTL* in a
+simulator (xsim), driven by the same testbench — it tests the *hardware*,
+cycle-accurate. csim answers "is my C correct?"; cosim answers "does the
+generated hardware match my C?" (and gives measured latency/interval).
+
+**Q: What is AXI4-Stream and what do the wires do?** A one-directional,
+point-to-point streaming bus. TDATA = payload; TVALID (from source) = "data is
+valid"; TREADY (from sink) = "I can accept it"; a **beat transfers only when
+TVALID and TREADY are both high** (this handshake gives lossless back-pressure).
+TLAST = last beat of a frame; TKEEP/TSTRB = per-byte valid/type qualifiers.
+
+**Q: What is a data beat?** One transfer on the bus — the TDATA (+ side-signals)
+handed across in a single successful handshake. Here 1 beat = 1 complex sample;
+16 beats = 1 FFT frame (TLAST on the 16th). "Beat" means an *actual* transfer,
+which only happens on a cycle where both TVALID and TREADY are high.
+
+**Q: What is a sink (and source/master/slave)?** The sink is the receiver of a
+stream (drives TREADY); the source/master is the sender (drives TVALID/TDATA).
+Data flows source -> sink. In `fft_axis`, the input port is a sink (`in.read()`),
+the output port is a source (`out.write()`).
+
+**Q: Why is TDATA 40 bits?** 20-bit real + 20-bit imag (two Q5.15 values), the
+smallest byte-aligned width holding one complete complex sample per beat.
+
+**Q: What is routing (TDEST/TID)?** Choosing among multiple destinations when a
+stream switch fans data out to several sinks. TDEST = the "address" on the beat;
+TID = which source it came from. Irrelevant for a single point-to-point link, so
+we set those widths to 0.
+
+**Q: What does `#pragma HLS INTERFACE axis` do?** Turns a top-level `hls::stream`
+argument into a physical AXI4-Stream port. Without it: an internal stream is an
+on-chip FIFO, and a top-level stream defaults to a generic `ap_fifo` interface.
+With it: a standard AXIS port that interoperates with Xilinx streaming IP.
+(Note: AXI-Stream is a standardized *point-to-point* interface, not a shared
+addressed bus like AXI memory-mapped.)
+
+**Q: Why `keep = strb = -1`?** `-1` fills an unsigned fixed-width field with all
+1s, i.e. "all bytes valid" — the width-agnostic idiom.
+
+**Q: Difference between `fft_dataflow` and `fft_axis`?** `fft_axis` is the outer
+AXI-Stream I/O shell (bus <-> arrays); `fft_dataflow` is the inner engine that
+does the overlapped 4-stage FFT compute. `fft_axis` does NOT direct the
+inter-stage pipelining — that is `fft_dataflow`'s `dataflow` pragma. Once
+`fft_axis` is the top, `fft_dataflow` becomes an internal block (its arrays are
+on-chip buffers, not external ports).
 
 _Phase 1 HLS bring-up log. Companion to docs/hls_synthesis_results.md._

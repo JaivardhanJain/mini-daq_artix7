@@ -7,26 +7,27 @@
 # ==================================================================
 
 open_project mini_daq_fft_hls
-set_top fft_dataflow                 ;# top-level function to synthesize
+set_top fft_axis                     ;# AXI-Stream top (wraps fft_dataflow)
 
-# --- design sources (C++ now, for ap_fixed) ---
+# --- design sources (C++, ap_fixed + hls::stream) ---
+add_files fft_axis.cpp
 add_files fft_dataflow.cpp
 add_files bit_reverse.cpp
 
 # --- testbench + golden vectors ---
-add_files -tb fft_tb.cpp
+add_files -tb fft_tb_axis.cpp
 
 open_solution "sol1"
 set_part {xc7a35tftg256-1}           ;# Mini-DAQ board: XC7A35T-FTG256 (speed grade -1)
 create_clock -period 10 -name default ;# 10 ns = 100 MHz
 
-# 1) functional check vs golden vectors
+# 1) functional check vs golden vectors (Hour 2: streaming csim)
 csim_design -argv {C:/hls_minidaq/fft_test_vectors.txt}
 
-# 2) C synthesis -> RTL + timing/area/II report
-csynth_design
+# 2) C synthesis -> RTL (Hour 3: re-enable)
+# csynth_design
 
-# 3) (optional, later) verify generated RTL matches C
+# 3) co-simulation vs generated RTL (Hour 3: re-enable)
 # cosim_design -argv {C:/hls_minidaq/fft_test_vectors.txt}
 
 exit
