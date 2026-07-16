@@ -114,6 +114,113 @@ csynth estimate exactly), first result at ~76 cycles ≈ the 74-cycle latency
 estimate. The dataflow deadlock detector ran clean (no stalls). So the 74/19
 numbers are now measured, not just estimated.
 
+## 5.d  AXI-Stream version — synth + cosim (Day 8, Hours 2-3)
+
+Wrapped the verified `fft_dataflow` in an AXI4-Stream top (`fft_axis`) and
+re-synthesized. csim + cosim both **PASS 4/4**.
+
+**Interface transformed** (the point of the change): the old `ap_memory` array
+ports became real AXI4-Stream ports —
+`in_r: TDATA[40]/TVALID/TREADY/TLAST/TKEEP[5]/TSTRB[5]` (slave) and `out_r: ...`
+(master). Block control is still `ap_ctrl_hs` (start/done) — `ap_ctrl_chain`/
+`none` is the Hour-4 change.
+
+| Metric        | Array top (`fft_dataflow`) | Stream top (`fft_axis`) |
+|---------------|----------------------------|-------------------------|
+| DSP48         | 12                         | 12  (core unchanged)    |
+| LUT           | 1,350                      | 1,684  (+334 wrapper)   |
+| FF            | 1,668                      | 1,854  (+186 wrapper)   |
+| Fmax          | 152 MHz                    | 152 MHz                 |
+| Top latency   | 74 cycles                  | 112 cycles              |
+| Top interval  | 19 cycles                  | **113 cycles**          |
+| Ports         | ap_memory                  | AXI4-Stream             |
+| csim / cosim  | 4/4 / PASS                 | 4/4 / PASS              |
+
+**Why LUT/FF grew:** the stream wrapper adds read/write loops, the pack/unpack
+(`.range()`), address generation, and the TVALID/TREADY handshake FSM. The FFT
+core itself is byte-for-byte the same (still 12 DSP). Fits easily: 13% DSP /
+8% LUT / 4% FF.
+
+**Throughput regression to fix in Hour 4:** the interval jumped 19 -> 113 cycles
+(cosim confirms: frames complete 1130 ns = 113 cycles apart). Cause: `fft_axis`
+runs read-16 -> compute -> write-16 strictly in sequence, and `ap_ctrl_hs` blocks
+the next frame until the current one fully finishes — no frame overlap. Fix
+(Hour 4): `ap_ctrl_chain`/`ap_ctrl_none` for successive-frame overlap, and make
+`fft_axis` a dataflow region so read/compute/write run concurrently. Then the
+interval should drop back toward the core's ~19.
+
+## 5.e  Dataflow wrapper — throughput restored (Day 8, Hour 4)
+
+Added `#pragma HLS dataflow` to `fft_axis` and refactored the read/write phases
+into functions (`read_in`, `write_out`) so it's a clean 3-process region.
+
+**Result: interval 113 -> 20 cycles (~5.6x throughput), latency unchanged.**
+
+| Metric        | 5.d Stream (sequential) | 5.e Stream (dataflow) |
+|---------------|-------------------------|-----------------------|
+| Top interval  | 113 cycles              | **20 cycles**         |
+| Top latency   | 112 cycles              | 113 cycles            |
+| DSP48         | 12                      | 12                    |
+| LUT           | 1,684                   | 1,631                 |
+| FF            | 1,854                   | 1,937                 |
+| Fmax          | 152 MHz                 | 152 MHz               |
+| csim / cosim  | 4/4 / PASS              | 4/4 / PASS            |
+
+Per-process intervals: read_in 18, fft_dataflow 19, write_out 19 -> region
+interval = max ≈ 20. cosim confirms it in real sim: frames complete 200 ns =
+20 cycles apart. The `X`/`OUT` buffers became ping-pong (PIPO) memories (the
+doubled storage that lets the phases overlap); area barely moved.
+
+**Note:** the dataflow pragma alone achieved the overlap under `ap_ctrl_hs` (the
+region pipelines the frames itself). `ap_ctrl_none`/`ap_ctrl_chain` is still
+recommended for continuous free-running operation in the SoC and to clear the
+`HLS 200-786` dataflow-on-top warning — it's an integration refinement now, not
+a throughput fix.
+
+## 5.f  Free-running control + IP export (Day 8, Hour 4 — final)
+
+Added `#pragma HLS INTERFACE ap_ctrl_none port=return` to `fft_axis` and
+appended `export_design -format ip_catalog` to the tcl.
+
+**Result: throughput/area unchanged; the block is now free-running and packaged.**
+Exact figures from `fft_axis_csynth.rpt`:
+
+| Metric         | 5.e Stream (ap_ctrl_hs) | 5.f Stream (ap_ctrl_none) |
+|----------------|-------------------------|---------------------------|
+| Top interval   | 20 cycles               | **20 cycles**             |
+| Top latency    | 113 cycles (1.130 us)   | 113 cycles (1.130 us)     |
+| DSP48          | 12                      | 12   (13%)                |
+| LUT            | 1,631                   | 1,629  (7%)               |
+| FF             | 1,937                   | 1,937  (4%)               |
+| BRAM_18K       | 0                       | 0                         |
+| Estimated Fmax | 152 MHz                 | **151.77 MHz** (6.589 ns) |
+| Control ports  | ap_start/done/idle/ready| **none** (data-driven)    |
+| HLS 200-786    | present                 | **cleared**               |
+| csim / cosim   | 4/4 / PASS              | 4/4 / PASS                |
+
+The numbers barely move (LUT 1631 -> 1629, the two gates of the dropped handshake)
+because `ap_ctrl_none` only changes *how the block is triggered*, not the
+datapath. Per-process breakdown from the report: `read_in` interval 18, `write_out`
+19, `fft_dataflow` 19 (latency 74) -> region interval = max ≈ **20**; the FFT core
+holds all 12 DSP, the wrapper adds only `read_in` 71 LUT / `write_out` 108 LUT.
+
+**Interface table confirms the free-running control** — the only non-AXIS ports
+are `ap_clk` and `ap_rst_n` (both listed under protocol `ap_ctrl_none`); every
+data port is `axis` (`in_r_/out_r_ TDATA[40]/TVALID/TREADY/TLAST/TKEEP[5]/TSTRB[5]`).
+The `ap_start/done/idle/ready` ports are gone. cosim still PASS 4/4 (the dataflow
+monitor + TLAST bound each frame in place of `ap_done`).
+
+**Timing headroom:** estimated critical path 6.589 ns against the 10 ns target
+(2.70 ns uncertainty guardband) — ~3.4 ns slack, i.e. the design would close
+timing well above 100 MHz with room for the rest of the SoC's routing.
+
+**IP export:** `export_design` packaged the RTL as a Vivado IP-catalog bundle at
+`mini_daq_fft_hls/sol1/impl/export.zip` (VLNV `wadhwani:daq:fft_axis:1.0`). This
+required working around a Vitis 2020.2 date bug — the auto-generated
+`core_revision` (`YYMMDDHHMM` = 2607161630) overflows a 32-bit signed int in
+2026; temporarily setting the PC clock to 2021 let it pack. See engineering log
+3.13. **This completes the HLS optimization track.**
+
 ## Notes
 - `fft_stage_one` uses **0 DSPs** (twiddle W^0 = 1 -> pure add/sub); stages 2-4
   use 4 DSPs each = 12 total.
@@ -122,10 +229,11 @@ numbers are now measured, not just estimated.
 - Buffers between stages: ping-pong (PIPO), 0 BRAM (distributed RAM).
 - Twiddles synthesized as ROMs. Interface: `ap_memory` + `ap_ctrl_hs`.
 
-## Known follow-ups (not yet done)
-- `ap_ctrl_chain` for frame-to-frame overlap (streaming DAQ throughput).
-- AXI-Stream interfaces for XADC -> FFT -> MicroBlaze integration.
-- cosim to confirm RTL matches C.
+## Known follow-ups
+- **DONE:** AXI-Stream interface (5.d), frame-throughput dataflow (5.e),
+  free-running `ap_ctrl_none` + IP export (5.f), cosim RTL-vs-C at every step.
+- Next phase: Vivado block design — instantiate the exported IP and wire
+  XADC -> FFT -> DMA -> MicroBlaze.
 - Later: per-stage bit-growth types (vs uniform Q5.15), scale N to 64-256.
 
 _Generated during Phase 1 HLS bring-up (Day 7 — 2026-07-14; design decisions were Day 2, 2026-07-07)._

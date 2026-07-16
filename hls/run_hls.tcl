@@ -25,9 +25,15 @@ create_clock -period 10 -name default ;# 10 ns = 100 MHz
 csim_design -argv {C:/hls_minidaq/fft_test_vectors.txt}
 
 # 2) C synthesis -> RTL (Hour 3: re-enable)
-# csynth_design
+csynth_design
 
 # 3) co-simulation vs generated RTL (Hour 3: re-enable)
-# cosim_design -argv {C:/hls_minidaq/fft_test_vectors.txt}
+cosim_design -argv {C:/hls_minidaq/fft_test_vectors.txt}
+
+# 4) package the RTL as a Vivado IP-catalog bundle (Day 8, final step)
+#    Output: mini_daq_fft_hls/sol1/impl/ip/*.zip  (drop into Vivado IP catalog)
+export_design -format ip_catalog -rtl verilog \
+    -display_name "Mini-DAQ 16-pt FFT (AXIS)" \
+    -vendor wadhwani -library daq -version 1.0
 
 exit

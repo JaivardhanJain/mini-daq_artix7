@@ -198,6 +198,29 @@ everywhere to avoid the collision entirely.
 **Lesson:** include third-party/library headers before defining short, common
 macro names; or namespace your macros (`FFT_SIZE`).
 
+### 3.13 `export_design` fails: "bad lexical cast" on `core_revision` (Day 8)
+**Symptom:** csim/csynth/cosim all PASS, but `export_design` errored at the very
+end:
+`rdi::set_property core_revision 2607161630 ...` -> `bad lexical cast: source
+type value could not be interpreted as target` -> `ERROR [IMPL 213-28] Failed to
+generate IP.`
+**Cause:** a Vitis HLS 2020.2 date bug, *not* a design bug. When packaging the
+IP, Vivado stamps a `core_revision` built from the current date/time as
+`YYMMDDHHMM` — here `2607161630` (year **26**, 07/16, 16:30). That value is
+stored in a **32-bit signed integer**, whose max is 2,147,483,647. In 2026 the
+revision (2,607,161,630) exceeds it and overflows, so the Tcl `set_property`
+cast fails. In 2020-2021 the stamp was ~`20xxxxxxxx` and fit; the tool simply
+predates today's date. No `export_design` flag overrides `core_revision`.
+**Fix (done):** temporarily set the Windows clock back to **2021-01-01** (turn
+off "set time automatically"), re-ran `vitis_hls -f run_hls.tcl`, then restored
+the clock. The revision became `2101010000`, fit in 32 bits, and packaging
+completed: `Generated output file .../sol1/impl/export.zip`. The sim log
+timestamps reading "2021" confirm the workaround was active.
+**Lesson:** old vendor tools can carry Y2K-style integer-overflow bugs tied to
+wall-clock date; a temporary clock roll-back is the standard workaround (restore
+it immediately after — a backdated clock disturbs OneDrive sync and git commit
+times). Alternatively, a newer Vitis (2022.1+) fixes it.
+
 ---
 
 ## 4. Verification methodology (how correctness was ensured)
@@ -282,13 +305,34 @@ hardware. It also confirmed the estimates with a real sim: measured interval
 = **19 cycles** (transactions 190 ns apart) and latency ~76 ≈ the 74 estimate,
 deadlock detector clean. So 74/19 are now measured, not estimated.
 
+## 5.d  AXI-Stream version — synth + cosim (Day 8, Hours 2-3)
+
+Wrapped `fft_dataflow` in an AXI4-Stream top (`fft_axis`); re-synthesized and
+cosim'd. **csim + cosim PASS 4/4.** The top-level ports are now real AXIS
+(`in_r/out_r: TDATA[40]/TVALID/TREADY/TLAST/TKEEP[5]/TSTRB[5]`), replacing the
+old `ap_memory` ports — the goal of the conversion. Area: DSP unchanged (12),
+LUT 1350->1684, FF 1668->1854 (the ~+334 LUT / +186 FF is the wrapper: read/write
+loops, pack/unpack, handshake FSM), Fmax still 152 MHz, fits at 13%/8%/4%.
+**Open item (Hour 4):** top-level interval regressed 19 -> 113 cycles because
+`fft_axis` does read -> compute -> write in sequence under `ap_ctrl_hs` (no frame
+overlap). Fix with `ap_ctrl_chain`/`none` + making `fft_axis` a dataflow region.
+Full numbers: `docs/hls_synthesis_results.md` section 5.d.
+
 ## 6. Known remaining work (honest status)
 
-- **AXI-Stream interfaces** (Day 8, Hours 2-3, in progress) to integrate with
-  XADC -> FFT -> MicroBlaze.
-- `ap_ctrl_chain` / `ap_ctrl_none` for frame-to-frame overlap (Day 8, Hour 4).
-- `export_design` to package the Vivado IP (Day 8, Hour 4).
+- **AXI-Stream interface: DONE** (Hours 2-3) — synth + cosim PASS, AXIS ports.
+- **Restore frame throughput: DONE** (Hour 4) — `fft_axis` dataflow region,
+  interval 113 -> 20, cosim PASS. (See 8.1.)
+- **`ap_ctrl_none` free-running control: DONE** (Hour 4) — csynth + cosim PASS,
+  `ap_start/done/idle/ready` removed, HLS 200-786 warning cleared. (See 8.2.)
+- **`export_design` — Vivado IP packaged: DONE** (Hour 4) — `export.zip`
+  generated after working around the 2020.2 date-overflow bug (see 3.13).
 - Later: per-stage bit-growth types (vs the single uniform Q5.15), scale N to 64-256.
+
+**HLS track status: COMPLETE.** verified -> csynth -> Q5.15 -> loop-flatten ->
+AXI-Stream -> dataflow throughput -> free-running -> IP export, every stage
+cosim-PASS. Next project phase is Vivado block-design / SoC integration (and, in
+parallel, the hand-RTL FFT that is the portfolio centerpiece).
 
 ---
 
@@ -382,6 +426,96 @@ MicroBlaze/DMA). Key decisions and why:
 - **Deferred:** block-level control (`ap_ctrl_chain`/`ap_ctrl_none`) for
   frame-to-frame overlap is left to Hour 4 — Hours 2-3 only prove the streaming
   interface is functionally correct.
+
+### 8.1 Hour-4 fix — restore frame throughput
+
+**STATUS: DONE (dataflow half).** Refactored `fft_axis` into `read_in` /
+`fft_dataflow` / `write_out` and added `#pragma HLS dataflow`. HLS extracted
+3 processes; **interval dropped 113 -> 20 cycles** (~5.6x), latency unchanged
+(~113), DSP 12, Fmax 152, cosim PASS 4/4 (frames 20 cycles apart in sim). The
+`X`/`OUT` buffers became ping-pong (PIPO) memories. See `hls_synthesis_results.md`
+section 5.e. Honest note: the dataflow pragma alone achieved the overlap under
+`ap_ctrl_hs` (I had expected it to also need `ap_ctrl_chain` — it didn't).
+`ap_ctrl_none`/`ap_ctrl_chain` remains a recommended integration refinement
+(continuous free-running, clears the `HLS 200-786` warning), not a throughput fix.
+
+**Original plan (for reference):**
+
+**Problem:** the AXIS wrapper `fft_axis` runs read-16 -> compute -> write-16 in
+strict sequence, and `ap_ctrl_hs` blocks the next frame until the current one
+finishes. So interval = read + compute + write ≈ 16 + 74 + 16 ≈ **113 cycles**
+(measured in cosim) — a ~6x throughput regression vs the core's interval of 19.
+Correctness and per-frame latency are fine; only *how often* a frame can start
+is bad.
+
+**Fix (two changes):**
+1. **Make `fft_axis` a dataflow region** (`#pragma HLS dataflow`): read / compute
+   / write become three concurrent processes connected by ping-pong buffers, so
+   read(N+1), compute(N), and write(N-1) run at the same time instead of in
+   sequence.
+2. **Change block control to `ap_ctrl_chain`** (successive frames pipeline) or
+   **`ap_ctrl_none`** (free-running / purely data-driven, ideal for a live DAQ) —
+   this removes the per-frame start/done barrier of `ap_ctrl_hs`.
+
+**Why it helps (theory):** pipelining converts a *sequential* interval into an
+*overlapped* one: `interval = t_read + t_compute + t_write` becomes
+`interval = max(t_read, t_compute, t_write)`. Here read=16, write=16, and the FFT
+core sustains ~19, so the interval collapses to `max(16,19,16) ≈ 19-20`. It's the
+same pipelining idea as the FFT stages, applied one level up (the loading-dock
+accepts the next truck while the line builds the current and ships the previous).
+
+**Estimated outcome:** interval **~113 -> ~19-24** (≈5-6x throughput); latency
+per frame roughly **unchanged** (~110 cycles — a frame still traverses all three
+phases); Fmax ~152 MHz; DSP still 12; small area bump for the ping-pong buffers.
+Then `export_design` to package the Vivado IP. Verify with csim/cosim (expect
+4/4) and read the new interval from csynth. (Exact interval TBD — ping-pong
+fill/drain may leave it slightly above 19.)
+
+### 8.2 Block-level control + IP export — design decisions (Day 8, Hour 4)
+
+Two final integration decisions turned the verified stream block into a
+drop-in Vivado IP.
+
+- **`ap_ctrl_none` (free-running), not `ap_ctrl_hs` or `ap_ctrl_chain`.**
+  The block-level control protocol decides *how the block is told to start and
+  how it reports done*. There are three choices:
+  - `ap_ctrl_hs` (HLS default): a start/done handshake — the block waits for
+    `ap_start`, runs one call, raises `ap_done`. Successive frames can't overlap
+    (the source of the 113-cycle regression in 8.1), and it adds `ap_start/
+    ap_done/ap_idle/ap_ready` ports plus the `HLS 200-786` warning.
+  - `ap_ctrl_chain`: like `hs` but lets consecutive calls pipeline — good when a
+    *parent* block sequences the calls.
+  - `ap_ctrl_none` (chosen): **no control handshake at all.** The block is purely
+    data-driven — it runs whenever its AXI-Stream input has data and its output
+    can accept, gated only by TVALID/TREADY. This is exactly right for a live DAQ
+    where the XADC produces samples continuously and nothing "starts" the FFT per
+    frame; TLAST already delimits frames.
+  *Why `none` over `chain`:* our data plane is self-synchronising through the
+  AXIS handshake and TLAST — there is no parent block issuing per-frame `ap_start`
+  pulses, so a start/done protocol is dead weight. `none` removes the four
+  control ports, clears `HLS 200-786`, and matches "the hardware simply flows
+  data" semantics. Applied as `#pragma HLS INTERFACE ap_ctrl_none port=return`.
+  *Result:* csynth confirms `Setting interface mode on function 'fft_axis' to
+  'ap_ctrl_none'`; the port list drops `ap_start/done/idle/ready`, keeping only
+  the AXIS ports + `ap_clk`/`ap_rst_n`. cosim still PASS 4/4.
+  *Cosim caveat that didn't bite:* `ap_ctrl_none` removes `ap_done`, so I
+  expected cosim to fail (no completion signal for the testbench). It passed —
+  Vitis's dataflow testbench bounds each frame with the deadlock/transaction
+  monitor and TLAST instead of `ap_done`. Good to know: free-running blocks are
+  still cosim-able.
+
+- **`export_design -format ip_catalog` — package as a Vivado IP-catalog block.**
+  *What it does:* takes the generated RTL and wraps it as an IP-XACT bundle
+  (`export.zip`) with the AXIS port interfaces described, so Vivado's IP catalog
+  can instantiate `fft_axis` in a block design and auto-connect it to the XADC,
+  a DMA, or MicroBlaze. *Why this format:* `ip_catalog` is the block-design flow
+  (vs `syn_dcp`/`ip_catalog` alternatives) — the canonical path for
+  `XADC -> FFT -> DMA -> MicroBlaze` SoC assembly. Given cosmetic VLNV identity
+  `wadhwani:daq:fft_axis:1.0` via `-vendor/-library/-version` so it's findable in
+  the catalog. Placed *after* `csynth_design` in the tcl (it packages synthesized
+  RTL — nothing exists to export before synthesis). Output:
+  `mini_daq_fft_hls/sol1/impl/export.zip`. (The date-overflow bug hit here; see
+  3.13.)
 
 ## 9. FAQ — AXI-Stream & verification concepts
 
