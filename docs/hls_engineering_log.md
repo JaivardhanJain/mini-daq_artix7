@@ -238,6 +238,216 @@ times). Alternatively, a newer Vitis (2022.1+) fixes it.
 5. **csynth** — read timing (Fmax), II per loop, and utilization; used the
    utilization table to prove the fixed-point design fits.
 
+### 4.1 Are 4 vectors enough? Coverage gaps + randomized differential test
+
+**Honest verdict: the 4 curated vectors are a strong *smoke test*, not a
+correctness sign-off.** What they do cover is better than it looks — the
+**impulse** exercises every twiddle multiply and every butterfly path (an impulse
+excites all frequencies), **DC** stresses the worst-case bit-growth (this is how
+the 8.0 peak was found), **two-tone** checks linearity/superposition, and the
+**single sine** checks that energy lands in the correct bin. But they are not
+enough to call the FFT verified. The gaps:
+
+1. **Magnitude-only comparison.** The testbench diffs `|X[k]|`, so a sign flip or
+   any phase error that preserves magnitude would pass all four. Fix: compare
+   **real and imag** (or magnitude *and* phase).
+2. **No input-space coverage.** Four fixed, "clean" patterns. Fixed-point
+   correctness is really about rounding/quantization-error accumulation on
+   *arbitrary* inputs — untested by these four.
+3. **No boundary/overflow testing.** Inputs never pushed near ±full-scale, so
+   saturation/overflow behavior at the Q5.15 edges is unexercised.
+4. **Missing bins.** Tested bins 3 and 5; never bin 1 or the Nyquist bin (8).
+5. **cosim added no input coverage** — it re-ran the *same* four inputs as RTL
+   vs C, which proves RTL==C but not correctness over more inputs.
+
+**Planned enhancement — randomized differential test (csim).** Add a self-checking
+harness to the C testbench that compares the DUT against a trusted reference over
+thousands of random frames:
+
+- **Reference** = a double-precision direct O(N²) DFT (obviously correct; same
+  unnormalized definition as the Python golden model, which itself is cross-checked
+  vs NumPy). The DUT is the fixed-point HLS FFT.
+- **~10,000 seeded-random frames**, inputs bounded `|x| <= 0.5` so the DC bin
+  (≤ N·0.5 = 8) stays inside Q5.15's ±16 — no overflow masking real errors.
+- **Compare real AND imag** (closes the phase gap), track the worst absolute
+  error over all frames and bins, assert `< TOL`.
+- **Compare against the DFT of the *quantized* input** (feed the same quantized
+  values into the reference), so the metric isolates the FFT's internal
+  fixed-point error from input-quantization error.
+- **Add explicit stress frames:** near-full-scale all-positive / all-negative
+  (bounded so DC < 16), impulse, DC, single tones at **bin 1 and the Nyquist
+  bin**, plus a **Parseval invariant** check (`Σ|X[k]|² = N·Σ|x[n]|²`).
+- **Tolerance from LSB analysis:** Q5.15 LSB = 2⁻¹⁵ ≈ 3.05e-5; error accumulates
+  over the 4 stages, so expect worst ≈ 1e-3…1e-2 — set generous, then tighten to
+  the measured worst.
+- **Where it runs:** the 10k volume runs in **csim** (seconds on CPU); **cosim**
+  keeps the 4 curated vectors plus ~a dozen random frames as a spot check (RTL
+  sim is far too slow for 10k).
+
+Sketch:
+
+```cpp
+#include <cmath>
+#include <cstdlib>
+
+// trusted reference: naive O(N^2) DFT in double
+static void ref_dft(const double xr[SIZE], const double xi[SIZE],
+                    double Xr[SIZE], double Xi[SIZE]) {
+  for (int k = 0; k < SIZE; k++) {
+    double sr = 0, si = 0;
+    for (int n = 0; n < SIZE; n++) {
+      double a = -2.0 * M_PI * k * n / SIZE, c = cos(a), s = sin(a);
+      sr += xr[n]*c - xi[n]*s;
+      si += xr[n]*s + xi[n]*c;
+    }
+    Xr[k] = sr; Xi[k] = si;
+  }
+}
+
+int random_diff_test() {
+  const int NTRIAL = 10000; const double AMP = 0.5, TOL = 5e-3;
+  srand(12345);                                  // reproducible
+  double worst = 0;
+  for (int t = 0; t < NTRIAL; t++) {
+    double xr[SIZE], xi[SIZE]; DTYPE in_R[SIZE], in_I[SIZE], out_R[SIZE], out_I[SIZE];
+    for (int n = 0; n < SIZE; n++) {
+      double v = ((double)rand()/RAND_MAX*2 - 1) * AMP;
+      in_R[n] = (DTYPE)v; in_I[n] = (DTYPE)0;    // quantize to Q5.15
+      xr[n] = (double)in_R[n]; xi[n] = 0.0;      // reference sees the QUANTIZED input
+    }
+    double Xr[SIZE], Xi[SIZE]; ref_dft(xr, xi, Xr, Xi);
+    run_dut(in_R, in_I, out_R, out_I);           // pack->fft_axis->unpack (reuse existing tb helper)
+    for (int k = 0; k < SIZE; k++) {
+      worst = fmax(worst, fabs((double)out_R[k] - Xr[k]));
+      worst = fmax(worst, fabs((double)out_I[k] - Xi[k]));
+    }
+  }
+  printf("random-diff: %d frames, worst|err|=%.6f (tol %.4f) -> %s\n",
+         NTRIAL, worst, TOL, worst < TOL ? "PASS" : "FAIL");
+  return worst < TOL ? 0 : 1;
+}
+```
+
+`run_dut()` is the pack-into-stream / call `fft_axis` / pop-output helper the
+existing streaming testbench already contains. **Status: DONE (run 2026-07-21).**
+Implemented in `fft_tb_axis.cpp` (`run_dut`/`ref_dft`/`check_frame`/
+`random_diff_test`/`boundary_test`). Result: csim 10,000 random frames worst
+**4.6 LSB**, Parseval residual < 6.1e-5, six boundary/corner frames pass (worst
+4.1 LSB), tolerance calibrated to 3e-4; cosim of 16 random + 4 directed + 6
+boundary frames **C/RTL PASS** (worst 3.2 LSB). The FFT is fully verified.
+Interview framing: *"Four targeted vectors plus cosim were a smoke test; to fully
+sign it off I'd add randomized differential testing against the golden model,
+compare complex (not just magnitude), and stress the fixed-point range at the
+boundaries plus a Parseval check."*
+
+### 4.2 The four vectors — what each one tests
+
+Each vector was chosen to exercise a *different* behavior of the FFT, so together
+they form a quick but broad smoke test. Bin numbering is 0…15; for a **real**
+input, the spectrum is conjugate-symmetric, so a tone at bin `k` also appears
+mirrored at bin `N−k`.
+
+**1. DC — constant input.** `x[n] = 0.5` for all n (a flat, zero-frequency
+signal).
+- *Expected:* all energy in **bin 0**; `X[0] = Σx[n] = 16 × 0.5 = 8.0`, every
+  other bin ≈ 0.
+- *What it tests:* (a) the **accumulation path** — bin 0 is literally the sum of
+  all inputs; (b) **worst-case bit-growth** — the DC bin is the largest output the
+  transform can produce, so it's where overflow first appears. This vector is what
+  proved a plain Q1.15 (±1) would overflow and drove the move to **Q5.15** (peak
+  8.0 sits safely inside ±16); (c) **cancellation** — every non-DC bin must sum to
+  zero, which only happens if the twiddle signs/symmetry are correct.
+
+**2. Single sine — pure tone at bin 3.** `x[n] = sin(2π·3·n/16)`.
+- *Expected:* energy concentrated at **bin 3** (and its real-input mirror, bin 13);
+  all other bins ≈ 0.
+- *What it tests:* **frequency localization and twiddle correctness** — a single
+  frequency must land in exactly the right bin. If the twiddle factors (the
+  `W = e^{-j2πkn/N}` rotations) were wrong, the energy would smear across bins or
+  land in the wrong one. Also confirms the **conjugate symmetry** expected of a
+  real input.
+
+**3. Two-tone — bins 3 and 5 together.** `x[n] = sin(2π·3·n/16) + sin(2π·5·n/16)`.
+- *Expected:* two clean peaks, at **bins 3 and 5** (mirrors at 13 and 11).
+- *What it tests:* **linearity / superposition** — the FFT of a sum must equal the
+  sum of the FFTs, and two simultaneous frequencies must resolve into two *separate*
+  bins with no cross-talk. A nonlinear bug (e.g. an overflow wrap or a bad
+  intermediate rounding) would create spurious "intermodulation" bins that
+  shouldn't be there. Also a basic **bin-resolution** check.
+
+**4. Impulse — unit sample.** `x[0] = <value>`, `x[n] = 0` for n ≠ 0.
+- *Expected:* a **flat spectrum** — `|X[k]|` is the *same constant* across all 16
+  bins, because the DFT of a delta is flat.
+- *What it tests:* the best **structural coverage** of the four — an impulse
+  contains every frequency equally, so *every* output bin is non-zero and *every*
+  twiddle multiply and butterfly path is exercised in one shot. Because the
+  expected answer is a known flat line, any single broken butterfly or twiddle
+  shows up immediately as one bin that deviates. It also checks the
+  **bit-reversal / data routing** (the lone non-zero sample has to reach every
+  stage correctly).
+
+**Why these four together:** they deliberately span four distinct failure
+surfaces — accumulation + bit-growth (DC), frequency placement + twiddles (sine),
+linearity (two-tone), and whole-datapath structural coverage (impulse). That's why
+they're a good *smoke test*; §4.1 explains why they still aren't a full sign-off.
+
+### 4.3 Verification taxonomy — is this "formal verification"? (where this project sits)
+
+**No — none of this is formal verification.** It is *simulation-based functional
+verification*. The two are different families and the distinction matters in an
+interview, so it's captured here.
+
+**Formal verification** = using mathematical methods to **prove or disprove** that a
+design meets a formal specification, **exhaustively over all inputs/states**,
+*without running test cases*. It reasons symbolically about every behavior at once
+and returns a proof or a counterexample. The key word is *exhaustive*: simulation
+*samples* the input space, formal *covers* it. (Dijkstra: "testing shows the
+presence, not the absence, of bugs.") For context, sampling really is a tiny
+fraction here — the input space of a 16-point Q5.15 frame is 2^(16×20) ≈ 10^96
+possible frames, so even 10k random frames is a vanishing slice.
+
+Formal comes in three hardware families:
+- **Equivalence checking (LEC):** proves two representations compute the *same*
+  function for all inputs (e.g. RTL vs synthesized gate netlist — standard ASIC
+  sign-off).
+- **Model / property checking (FPV):** proves temporal properties written as
+  assertions (SVA/PSL) hold across all reachable states, or returns a counterexample
+  (JasperGold, VC Formal).
+- **Theorem proving:** interactive mathematical proof of an algorithm (ACL2, Coq,
+  Isabelle) — how some FPUs/DSP kernels are proven at the math level.
+
+**What this project actually is — simulation-based (dynamic) functional
+verification:** the 4 curated vectors are **directed testing**; the planned random
+harness (§4.1) is **constrained-random** testing, and because it checks the DUT
+against an independent reference it is **differential / golden-model** testing.
+**cosim is co-simulation** — it checks RTL-vs-C equivalence, but *by simulating both
+on the same stimulus*, so it is still dynamic, **not** formal equivalence checking.
+All of it samples inputs and yields *statistical* confidence, never a proof of
+absence.
+
+**Could an FFT be formally verified, and why simulation is the norm?** In principle,
+parts could: equivalence-check the HLS RTL against the HLS C model, or property-check
+"no overflow given bounded inputs"; specialized **datapath / word-level** formal
+tools exist for arithmetic blocks (multipliers, MACs, fixed-point pipelines) because
+bit-level model checkers choke on wide arithmetic. But full formal proof of a
+fixed-point FFT is genuinely hard, which is *why* industry verifies DSP blocks by
+simulation-with-a-reference. The obstacle is the fixed-point rounding: the Q5.15 FFT
+is deliberately **not bit-exact** to the ideal DFT — it is *approximately* equal,
+within an error bound. Equivalence checking proves *exact* equality, so it doesn't
+apply against a floating reference; and proving a *bounded-error* property ("output
+always within k LSB of the true DFT") over a wide arithmetic datapath is exactly the
+quantitative, real-valued property formal tools struggle with. Simulation with a
+golden model sidesteps this — it *measures* the actual error empirically across many
+inputs, cheaply, and yields a concrete worst-case number.
+
+**Interview answer to "did you formally verify it?"** *"No — I used simulation-based
+functional verification with a reference model (directed + constrained-random +
+differential, plus co-simulation for C/RTL behavioral equivalence). Formal
+verification — equivalence checking or property proving — is the next rung; it's a
+poor fit for the fixed-point datapath because the design is approximate-by-design,
+but it would help on bounded properties like no-overflow or on C-to-RTL equivalence
+of the control logic."*
+
 ---
 
 ## 5. Results (measured)
@@ -566,4 +776,72 @@ inter-stage pipelining — that is `fft_dataflow`'s `dataflow` pragma. Once
 `fft_axis` is the top, `fft_dataflow` becomes an internal block (its arrays are
 on-chip buffers, not external ports).
 
-_Phase 1 HLS bring-up log. Companion to docs/hls_synthesis_results.md._
+---
+
+## 10. XADC DAQ front-end — design decisions (Day 10)
+
+The reused XADC project (`rtl/XADC controller`) is a pot→LED demo (reads VAUX5 via
+DRP, latches the top 8 of 12 bits to LEDs — see `docs/controller_verification.md`).
+For the DAQ it is being rebuilt as a new module **`xadc_daq.vhd`** that turns a
+conditioned analog input into verified Q5.15 samples. The pot→LED demo is left
+untouched as a fallback. Decisions and why:
+
+- **Convert inside `xadc_daq` (emit Q5.15 directly), not raw codes.**
+  *Why:* the module then hands out samples already in the FFT's number system, so
+  the downstream AXI-Stream framer is trivial (pack into `TDATA[19:0]`, `TLAST`
+  every 16th). Clean separation of concerns — the front-end's job is "give me
+  real-world samples in Q5.15." *Trade-off:* the module is now DAQ-specific rather
+  than a generic ADC reader — acceptable.
+
+- **Output interface = `sample(19 downto 0)` (Q5.15) + `sample_valid` (one-cycle pulse).**
+  *Why:* `sample` is exactly the 20 bits `fft_axis` packs into `TDATA[19:0]`;
+  `sample_valid` is the handshake the framer / FFT read side keys off. One sample
+  emitted per conversion.
+
+- **Use the full 12-bit result, center (−2048), then shift left 4.**
+  `raw = drp_do(15 downto 4)`; `centered = raw − 2048`; `sample = centered << 4`
+  (sign-extended to 20 bits).
+  *Why full 12 bits:* the demo threw away 4 bits (`[15:8]`); the DAQ keeps the full
+  resolution. *Why −2048:* XADC unipolar reads 0…4095 for 0…1 V, so mid-scale 2048
+  maps mid-rail to zero (signed −2048…+2047). *Why <<4:* maps ADC full-scale to
+  Q5.15 ±1.0 (2048 = 2¹¹, Q5.15 1.0 = 2¹⁵), landing the sample in [−1.0, +1.0) —
+  well inside ±16 so the FFT's bit-growth has headroom. *Consequences:* it is a
+  **normalized** mapping (full-scale = ±1.0), so absolute-voltage calibration, if
+  ever wanted, is a Python-side scale factor; and any residual DC (signal not
+  perfectly mid-rail) shows up in bin 0 — expected and ignorable.
+
+- **Unipolar mode + external mid-rail bias (`BIPOLAR` generic, default false).**
+  *Why:* simplest path for a single-ended source, and it matches the subtract-2048
+  conversion. Bipolar (XADC returns signed two's-complement, skip the subtract) is
+  kept as a generic for a future differential source but doesn't save the biasing
+  circuit (only the *difference* is bipolar), so it isn't worth the overhead now.
+  *Consequence:* requires an external conditioning circuit to put the signal in 0–1 V.
+
+- **Compile-time generics: `DADDR=0x15` (VAUX5), `BIPOLAR=false`, `SHIFT=4`.**
+  *Why:* channel, polarity, and full-scale scaling become configurable without
+  touching logic — parameterized like N, at zero runtime cost. Runtime
+  configurability (register file / MicroBlaze control, live channel/rate switching)
+  is deferred — simpler build; that's Phase-4 territory.
+
+- **Sample rate + averaging live in the XADC Wizard IP, not the RTL.**
+  *Why:* Fs (~1 MSPS) sets Nyquist (500 kHz) and FFT bin spacing (Fs/16 =
+  **62.5 kHz/bin**) — the main DAQ knobs — but they sit in the IP's ADC-clock
+  divider / averaging config. Changing Fs means regenerating the IP, not editing
+  `xadc_daq`. Documented, not exposed as RTL generics.
+
+- **Input = a *conditioned* external analog signal on VAUX5.**
+  *Why / consequence:* the XADC input accepts **0–1 V only**, so a bench source
+  (function generator, etc.) cannot connect directly — over-range risks damaging
+  the pin. A front-end must attenuate, DC-bias to mid-rail, anti-alias below
+  Nyquist, and protect the input. This is a hardware task outside the RTL. For
+  demos, pick test tones at bin centers (k·Fs/16) and below Nyquist to avoid
+  leakage/aliasing.
+
+- **Verification approach (Hour 3):** because the conversion is internal and
+  deterministic, `xadc_daq` is **unit-testable by mocking the DRP side** — drive
+  `drp_do` with known codes and `drdy`, and check the Q5.15 output (mid-scale → ~0,
+  full-scale → ±expected) and that `sample_valid` pulses once per read. No analog
+  stimulus needed.
+
+_Phase 1 HLS bring-up log + Day-10 XADC front-end decisions.
+Companion to docs/hls_synthesis_results.md, docs/controller_verification.md._
