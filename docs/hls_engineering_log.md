@@ -843,5 +843,90 @@ untouched as a fallback. Decisions and why:
   full-scale → ±expected) and that `sample_valid` pulses once per read. No analog
   stimulus needed.
 
-_Phase 1 HLS bring-up log + Day-10 XADC front-end decisions.
+---
+
+## 11. SoC integration (Day 11)
+
+### 11.1 MicroBlaze SoC scaffold (Hours 1–2)
+
+Built in a **new Vivado project at `C:\daq_soc`** (space-free, local), part
+`xc7a35tftg256-1`. Build flow mirrors the HLS one: the sources (RTL, `.xci`, the
+block-design Tcl exported via `write_bd_tcl` into `soc/`) live in the Mini-DAQ repo;
+the generated project is regenerated in `daq_soc` and **not** committed. *Why:*
+Vivado inside the OneDrive-synced, space-containing path caused file-lock failures
+on the sim log and broke Webtalk on the space in "Wadhwani Lab Research" — the same
+reason HLS builds in `C:\hls_minidaq`.
+
+Block design `daq_bd`, created via Block Automation on MicroBlaze:
+**MicroBlaze + 32 KB local memory + MDM (debug) + Clocking Wizard + Processor
+System Reset** plus an AXI interconnect. The `fft_axis` IP was added to the catalog
+from `hls/ip/fft_axis_1.0.zip`.
+
+- **Clock:** an external port `sys_clk_100` → the board's 100 MHz oscillator
+  (pin **N14**, LVCMOS33, `create_clock -period 10`) → the Clocking Wizard's
+  `clk_in1`. It is the only external pin at this stage (MDM uses internal JTAG,
+  memory is on-chip; the analog + UART pins come with the data plane).
+- **Reset (no board button):** tied off with constants, with the SoC self-resetting
+  via the clock's `locked`. The Clocking Wizard `reset` (active-**high**) is driven
+  by a Constant `0`; the Processor System Reset's `ext_reset_in`/`aux_reset_in`
+  (active-**low**) are driven by a Constant `1`. **Gotcha:** the proc-reset
+  "Ext Reset Logic Level" field is read-only in IP Integrator, so the polarity is
+  matched from the *constant value*, not by flipping the field — an active-low input
+  cannot be de-asserted by `0`, which would silently hold the CPU in reset even
+  though the design *validates*. `dcm_locked` (from the wizard's `locked`) then
+  releases the SoC reset once the clock stabilizes on power-up.
+
+Validated clean — a bare CPU + AXI backbone. The DAQ data plane (§11.2) mounts onto
+it.
+
+### 11.2 Data-plane: repack + FIFO (Hour 3)
+
+The FFT result stream (`fft_axis`: 40-bit AXIS beat per bin — real Q5.15 in
+`[19:0]`, imag Q5.15 in `[39:20]`) has to reach the MicroBlaze and then the host.
+Decisions and why:
+
+- **FFT output → CPU over an AXI-Stream FIFO, not DMA.** The UART throttles the
+  *display* rate to ~10–30 fps regardless of N, so the CPU only pulls the
+  occasional frame — a FIFO handles that at both N=16 and N=256. DMA's advantage
+  (bulk, CPU-offloaded, high sustained rate) is only needed for full-rate lossless
+  capture, which this DAQ doesn't do. Simpler bring-up, no DMA driver. FIFO depth
+  is a parameter, sized for one full (half-spectrum) frame.
+
+- **Send both real and imag to the CPU.** Python draws a magnitude spectrum
+  `|X[k]| = sqrt(re² + im²)`, which needs *both* components. Magnitude is computed
+  in Python (no on-chip sqrt) and phase is discarded — but you cannot get magnitude
+  from real alone, so both must go across.
+
+- **Repack 40→32: truncate each 20-bit value to 16, pack real+imag into one
+  32-bit word.** The CPU reads 32-bit words and 40 bits don't fit one. For a
+  *display*, 16 bits is already far more resolution than a plot can render, so
+  truncating lets real+imag share a single word — one read per bin, and half the
+  FIFO and UART traffic. Keeping full Q5.15 would force two reads/bin (or a wider
+  multi-read FIFO) to preserve precision the screen throws away.
+
+- **Truncate by dropping the LOW 4 bits (LSBs) → Q5.11, never the top.** *This is
+  the crux.* The output swings to ~±8 (the DC bin hit 8.0 in verification), so it
+  genuinely uses the integer bits. Dropping the **top** 4 bits collapses the range
+  Q5.15→Q1.15 (±16→±1) and clips every bin above magnitude 1 — i.e. the spectral
+  peaks, the whole point of the plot: catastrophic. Dropping the **bottom** 4 bits
+  keeps the full ±16 range (peaks intact) and only coarsens resolution 2⁻¹⁵→2⁻¹¹,
+  a low-level noise floor invisible on a plot. **Principle: preserve dynamic range /
+  headroom, sacrifice precision** — clipping large values is fatal, low-level
+  quantization noise is nothing. Keep bits `[19:4]` of each value.
+
+- **Carry only the N/2+1 unique bins, dropped BEFORE the FIFO.** A real input gives
+  a conjugate-symmetric spectrum (`X[N−k] = X[k]*`), so bins 9–15 are redundant
+  mirrors of 7–1. Keep only bins 0…N/2 (9 for N=16; **129 for the 256-point
+  endgame**). Dropping them before the FIFO halves FIFO depth, CPU reads, and UART
+  traffic — and that halving compounds at 256, directly easing FIFO/BRAM size and
+  the UART bottleneck.
+
+- **One `fft_repack` stage does both jobs.** As beats stream out of `fft_axis` in
+  bin order, it truncates 40→32 (`{OUT_R[19:4], OUT_I[19:4]}`), forwards only beats
+  0…N/2, drops the rest, and asserts `TLAST` on beat N/2 — emitting an (N/2+1)-beat
+  frame of 32-bit words (two Q5.11 halves). Parameterized on N so it scales to 256.
+  Host side: split each word into two signed 16-bit values, ÷2¹¹, then magnitude
+  (absolute scale is arbitrary for a plot anyway).
+
+_Phase 1 HLS bring-up log + Day-10 XADC front-end + Day-11 integration decisions.
 Companion to docs/hls_synthesis_results.md, docs/controller_verification.md._

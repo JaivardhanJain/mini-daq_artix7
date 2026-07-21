@@ -127,9 +127,12 @@ Day 10. (Full FFT test design: `docs/verification_methodology.md`.)
 - H1: unit-test the framer; start the Vivado block design.
 - H2: MicroBlaze + AXI infra (interconnect, clock wiz, proc reset, local mem, MDM);
   validate; bare CPU building.
-- H3: data plane — XADC front-end + framer + `fft_axis` IP + AXI-Stream FIFO
-  (**depth a parameter**, sized for one full frame) + a small **40→32 repack**
-  (FFT beat -> one CPU word per bin); wire XADC→framer→FFT→repack→FIFO; validate.
+- H3: data plane — XADC front-end + framer + `fft_axis` IP + a **`fft_repack`**
+  stage + AXI-Stream FIFO (depth a parameter). `fft_repack`: truncate each 20-bit
+  Q5.15 → 16-bit **Q5.11 by dropping the low 4 bits** (keeps ±16 range/peaks;
+  dropping MSBs would clip them), pack real+imag into one 32-bit CPU word, and keep
+  only the **N/2+1 unique bins** (real-input symmetry) — `TLAST` on bin N/2. Wire
+  XADC→framer→FFT→repack→FIFO; validate. (Full rationale: eng log §11.)
 
 **Designed for the 256-point endgame:** framer `FRAME`, FIFO depth, and the SW
 frame loop are all parameterized, so bumping N is config, not rework. The real
@@ -138,6 +141,11 @@ fix Q5.15 overflow via wider type or per-stage scaling, re-verify) — a separat
 ~1–2 day task after N=16 works end-to-end. `FRAME` must always equal FFT `SIZE`.
 - H4: attach UART + first MicroBlaze C (read a frame from the FIFO, send over UART).
 - H5: Python `pyserial`+`matplotlib` host + first end-to-end bring-up + triage.
+
+**Status: H1/H2 DONE** — MicroBlaze SoC scaffold (MicroBlaze + 32 KB LMB + MDM +
+Clocking Wizard on N14 + Processor System Reset) built and validated in a new local
+project `C:\daq_soc`; no-button reset tied off with constants (see eng log §11.1).
+Next up: H3 (`fft_repack` + data-plane wiring).
 
 Realistic: first SoC bring-up is fiddly (clocking/reset/BSP), so the Python plot +
 on-board end-to-end may spill to a Day 12.
