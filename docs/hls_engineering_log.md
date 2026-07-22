@@ -928,5 +928,52 @@ Decisions and why:
   Host side: split each word into two signed 16-bit values, ÷2¹¹, then magnitude
   (absolute scale is arbitrary for a plot anyway).
 
+  > **Naming:** the repack stage was built as **`axis_repack`** (the `fft_repack`
+  > above was the working name). Built + unit-verified `tb_axis_repack`:
+  > 18 words / 2 frames PASS, including a back-pressure pass (FIFO `m_tready`
+  > dropped mid-frame on a kept bin → the beat is held, `s_tready` goes low, data
+  > stays stable). The whole data plane then wired into `daq_bd` and **validated
+  > clean** (Day 11 H3, 2026-07-22).
+
+### 11.3 Data-flow / data-path (end-to-end)
+
+One sentence: a conditioned analog voltage on VAUX5 becomes a stream of Q5.15
+samples, is framed into 16-sample blocks, transformed into a 16-bin complex
+spectrum by the FFT, trimmed to the 9 unique bins as packed 32-bit words, buffered
+in a FIFO, read by the MicroBlaze, and sent over UART to a Python host that plots
+the magnitude. The full chain, with what each stage does to the data:
+
+`analog → xadc_daq → xadc_axis_framer → fft_axis → axis_repack → axi_fifo_mm_s → MicroBlaze → uart_tx → Python`
+
+- **`xadc_daq`** (wraps the `xadc_wiz_0` IP + `daq_sampler`): the XADC digitizes
+  VAUX5 (0–1 V) to a 12-bit unipolar code at ~1 MSPS; `daq_sampler` DRP-reads that
+  code, centers it (`− 2048`), and shifts it left 4 into a **signed 20-bit Q5.15
+  `sample`** in [−1, +1), with a one-cycle `sample_valid` per conversion.
+- **`xadc_axis_framer`**: packs each `sample` into one **40-bit AXI-Stream beat**
+  (`real = [19:0] = sample`, `imag = [39:20] = 0`, since the input is real) and
+  asserts `TLAST` on every 16th beat — turning the sample stream into 16-sample
+  frames for the FFT. Back-pressure-safe, with an `overflow` flag.
+- **`fft_axis`** (the HLS 16-point radix-2 DIT FFT, free-running `ap_ctrl_none`):
+  consumes a 16-beat real frame and emits a **16-beat complex spectrum**, same
+  40-bit layout (`real[19:0] + imag[39:20]`, Q5.15), bins in natural order 0…15,
+  `TLAST` on bin 15. Interval ~20 cycles, so it keeps up with the sample rate.
+- **`axis_repack`**: truncates each bin 40→32 by dropping the low 4 bits of real
+  and imag (**Q5.11**, packed `{real[19:4], imag[19:4]}`), forwards only the **9
+  unique bins 0…8** (conjugate symmetry makes 9…15 redundant), consumes-and-drops
+  the rest, and asserts `TLAST` on bin 8 → a **9-word, 32-bit frame**.
+- **`axi_fifo_mm_s`** (AXI4-Stream FIFO): buffers that 9-word frame on its stream
+  side and exposes it to the CPU over **AXI4-Lite** at base **`0x0001_1000`**; the
+  MicroBlaze reads the occupancy/length (`RDFO`/`RLR`) and pops words from `RDFD`.
+- **MicroBlaze → `uart_tx`** (Day 11 H4): polls the FIFO, reads the 9 words, and
+  streams the bytes out the wrapped custom UART at 115200 8-N-1.
+- **Python host** (Day 11 H5): reads the byte stream, splits each 32-bit word into
+  two signed 16-bit halves, scales by 2⁻¹¹, computes `|X[k]| = sqrt(re² + im²)`, and
+  plots the spectrum (~10–30 fps; the UART, not the FFT, sets the refresh rate).
+
+Everything runs in a **single 100 MHz clock domain**, and AXI-Stream `TVALID`/
+`TREADY` back-pressure propagates the whole length of the chain, so a busy FIFO
+stalls the pipeline cleanly rather than dropping data. Full per-signal detail,
+bit layouts, and rates are in **`docs/data_path.md`**.
+
 _Phase 1 HLS bring-up log + Day-10 XADC front-end + Day-11 integration decisions.
-Companion to docs/hls_synthesis_results.md, docs/controller_verification.md._
+Companion to docs/hls_synthesis_results.md, docs/controller_verification.md, docs/data_path.md._
